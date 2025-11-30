@@ -20,7 +20,7 @@ if HF_API_TOKEN is None:
 if API_KEY is None:
     raise RuntimeError("API_KEY not set in environment")
 
-HF_API_URL = f"https://api-inference.huggingface.co/models/{HF_MODEL_ID}"
+HF_API_URL = f"https://router.huggingface.co/hf-inference/models/{HF_MODEL_ID}"
 
 app = FastAPI(title="Bangla Shirk Detector API (HF Inference)")
 
