@@ -1,98 +1,99 @@
 import os
+import requests
 from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
-import torch
-import torch.nn.functional as F
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 
-# Load env (for local dev)
+# Load env vars when running locally.
+# On Render, env vars are injected automatically but load_dotenv() doesn't hurt.
 load_dotenv()
 
 HF_MODEL_ID = os.getenv("HF_MODEL_ID")
+HF_API_TOKEN = os.getenv("HF_API_TOKEN")
 API_KEY = os.getenv("API_KEY")
 
 if HF_MODEL_ID is None:
     raise RuntimeError("HF_MODEL_ID not set in environment")
+if HF_API_TOKEN is None:
+    raise RuntimeError("HF_API_TOKEN not set in environment")
 if API_KEY is None:
     raise RuntimeError("API_KEY not set in environment")
 
-app = FastAPI(title="Bangla Shirk Detector API")
+HF_API_URL = f"https://api-inference.huggingface.co/models/{HF_MODEL_ID}"
 
-# CORS for frontend access
+app = FastAPI(title="Bangla Shirk Detector API (HF Inference)")
+
+# Allow browser frontends to call this API
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # You can restrict later
+    allow_origins=["*"],  # you can restrict to your domain later
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Load trained model from HuggingFace Hub
-tokenizer = AutoTokenizer.from_pretrained(HF_MODEL_ID)
-model = AutoModelForSequenceClassification.from_pretrained(HF_MODEL_ID)
-model.eval()
-
-# Could be dict or list
-id2label = model.config.id2label
-
-
 class TextInput(BaseModel):
     text: str
-
 
 class PredictionOutput(BaseModel):
     label: str
     confidence: float
     probs: dict
 
-
 def verify_api_key(api_key: str | None):
     if api_key is None or api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
+def query_hf_inference(text: str):
+    headers = {
+        "Authorization": f"Bearer {HF_API_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    payload = {"inputs": text}
+
+    response = requests.post(HF_API_URL, headers=headers, json=payload, timeout=60)
+
+    if response.status_code != 200:
+        # HF may respond with {"error": "..."} while model is loading.
+        raise HTTPException(
+            status_code=500,
+            detail=f"Hugging Face Inference API error: {response.status_code}, {response.text}",
+        )
+
+    return response.json()
 
 @app.get("/")
 def root():
-    return {"message": "Shirk Detector API is online 🚀"}
-
+    return {"message": "Shirk Detector API (HF Inference) is online 🚀"}
 
 @app.post("/predict", response_model=PredictionOutput)
-def predict(input_data: TextInput, x_api_key: str = Header(None)):
+def predict(input_data: TextInput, x_api_key: str = Header(default=None)):
     verify_api_key(x_api_key)
 
-    inputs = tokenizer(
-        input_data.text,
-        return_tensors="pt",
-        truncation=True,
-        padding="max_length",
-        max_length=128,
-    )
+    hf_result = query_hf_inference(input_data.text)
 
-    with torch.no_grad():
-        outputs = model(**inputs)
-        logits = outputs.logits
-        probs = F.softmax(logits, dim=-1).squeeze().tolist()
-
-    pred_id = int(torch.argmax(logits, dim=-1).item())
-
-    # For dict id2label
-    if isinstance(id2label, dict):
-        pred_label = id2label[str(pred_id)]
-    else:
-        pred_label = id2label[pred_id]
-
-    prob_dict = {}
-    for i, p in enumerate(probs):
-        if isinstance(id2label, dict):
-            key = id2label[str(i)]
+    # Expected formats:
+    # 1) Single input: [ {"label": "...", "score": ...}, ... ]
+    # 2) Batched: [ [ {"label": "...", "score": ...}, ... ], ... ]
+    if isinstance(hf_result, list):
+        if len(hf_result) == 0:
+            raise HTTPException(status_code=500, detail="Empty response from Hugging Face")
+        if isinstance(hf_result[0], dict):
+            scores = hf_result                  # case 1: single input
+        elif isinstance(hf_result[0], list):
+            scores = hf_result[0]               # case 2: first element of batch
         else:
-            key = id2label[i]
-        prob_dict[key] = float(p)
+            raise HTTPException(status_code=500, detail=f"Unexpected HF response format: {hf_result}")
+    else:
+        raise HTTPException(status_code=500, detail=f"Unexpected HF response: {hf_result}")
+
+    probs = {item["label"]: float(item["score"]) for item in scores}
+    # Choose best label
+    best_label, best_conf = max(probs.items(), key=lambda kv: kv[1])
 
     return PredictionOutput(
-        label=pred_label,
-        confidence=prob_dict[pred_label],
-        probs=prob_dict,
+        label=best_label,
+        confidence=best_conf,
+        probs=probs,
     )
