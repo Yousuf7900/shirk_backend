@@ -1,12 +1,11 @@
 import os
-import requests
 from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
+from huggingface_hub import InferenceClient
 
-# Load env vars when running locally.
-# On Render, env vars are injected automatically but load_dotenv() doesn't hurt.
+# Load env vars for local dev. On Render, env vars are injected directly.
 load_dotenv()
 
 HF_MODEL_ID = os.getenv("HF_MODEL_ID")
@@ -20,7 +19,8 @@ if HF_API_TOKEN is None:
 if API_KEY is None:
     raise RuntimeError("API_KEY not set in environment")
 
-HF_API_URL = f"https://router.huggingface.co/hf-inference/models/{HF_MODEL_ID}"
+# Create a lightweight HF Inference client
+hf_client = InferenceClient(model=HF_MODEL_ID, token=HF_API_TOKEN)
 
 app = FastAPI(title="Bangla Shirk Detector API (HF Inference)")
 
@@ -46,22 +46,19 @@ def verify_api_key(api_key: str | None):
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
 def query_hf_inference(text: str):
-    headers = {
-        "Authorization": f"Bearer {HF_API_TOKEN}",
-        "Content-Type": "application/json",
-    }
-    payload = {"inputs": text}
-
-    response = requests.post(HF_API_URL, headers=headers, json=payload, timeout=60)
-
-    if response.status_code != 200:
-        # HF may respond with {"error": "..."} while model is loading.
+    """
+    Use HF InferenceClient for text classification.
+    This handles correct routing internally.
+    """
+    try:
+        # This returns a list of dicts or list of list of dicts
+        result = hf_client.text_classification(text)
+        return result
+    except Exception as e:
         raise HTTPException(
             status_code=500,
-            detail=f"Hugging Face Inference API error: {response.status_code}, {response.text}",
+            detail=f"Hugging Face Inference error: {str(e)}",
         )
-
-    return response.json()
 
 @app.get("/")
 def root():
@@ -74,22 +71,22 @@ def predict(input_data: TextInput, x_api_key: str = Header(default=None)):
     hf_result = query_hf_inference(input_data.text)
 
     # Expected formats:
-    # 1) Single input: [ {"label": "...", "score": ...}, ... ]
-    # 2) Batched: [ [ {"label": "...", "score": ...}, ... ], ... ]
+    # 1) [{"label": "...", "score": ...}, ...]
+    # 2) [[{"label": "...", "score": ...}, ...], ...]
     if isinstance(hf_result, list):
         if len(hf_result) == 0:
             raise HTTPException(status_code=500, detail="Empty response from Hugging Face")
         if isinstance(hf_result[0], dict):
-            scores = hf_result                  # case 1: single input
+            scores = hf_result          # single input
         elif isinstance(hf_result[0], list):
-            scores = hf_result[0]               # case 2: first element of batch
+            scores = hf_result[0]       # batched input
         else:
             raise HTTPException(status_code=500, detail=f"Unexpected HF response format: {hf_result}")
     else:
         raise HTTPException(status_code=500, detail=f"Unexpected HF response: {hf_result}")
 
+    # Convert to {label: prob}
     probs = {item["label"]: float(item["score"]) for item in scores}
-    # Choose best label
     best_label, best_conf = max(probs.items(), key=lambda kv: kv[1])
 
     return PredictionOutput(
